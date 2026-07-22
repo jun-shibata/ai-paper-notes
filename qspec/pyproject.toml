@@ -1,0 +1,22 @@
+[project]
+name = "qspec"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qspec"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
