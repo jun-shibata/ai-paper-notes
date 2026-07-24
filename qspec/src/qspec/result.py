@@ -7,6 +7,7 @@ from pathlib import Path
 class SampleResult:
     sample_id: str
     question: str
+    reference_answer: str
     generated_answer: str
     prompt_length: int
     answer_length: int
@@ -15,7 +16,8 @@ class SampleResult:
     top1_w4a16: list[int]
     top1_w4a4: list[int]
     matches: list[bool]
-
+    first_mismatch_position: int | None
+    w4a16_is_correct: bool | None
 
 def append_result_jsonl(
     result: SampleResult,
