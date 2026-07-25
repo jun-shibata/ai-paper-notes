@@ -29,9 +29,14 @@ def test_build_gsm8k_prompt():
         examples=examples,
     )
 
-    assert "Question: What is 1 + 1?" in prompt
-    assert "Question: What is 2 + 3?" in prompt
-    assert prompt.endswith("Answer:")
+    expected = (
+        "Q: What is 1 + 1?\n"
+        "A: 1 + 1 = 2. The answer is 2.\n\n"
+        "Q: What is 2 + 3?\n"
+        "A:"
+    )
+
+    assert prompt == expected
 
 
 def test_append_result_jsonl(tmp_path):

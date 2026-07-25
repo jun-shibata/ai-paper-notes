@@ -19,6 +19,7 @@ class SampleResult:
     first_mismatch_position: int | None
     w4a16_is_correct: bool | None
 
+
 def append_result_jsonl(
     result: SampleResult,
     output_path: Path,
