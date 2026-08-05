@@ -191,9 +191,348 @@ QSPEC は W4A4 の結果を W4A16 の予想と比較して検証しているた�
 Table 5 では、Llama-2-7b-chat-hf における QSPEC と EAGLE の比較を示している。EAGLEは、単一シーケンスの入力（バッチサイズ1）において最適な性能を発揮するが、バッチサイズが増加する（8および16）につれて、効率低下する。また、EAGLE のドラフトモデルは KV ストレージが増えることで16バッチで OOM となっている。それに対し、QSPEC は優れたスケーラビリティとメモリ効率を示しているとしている。
 
 # 6. 検証
-## 6.1 W4A4 と W4A16 Top-1 一致率検証
+## 6.1 W4A4 と W4A16 における Top-1 一致率の検証
 論文では、図2において以下の性質が認められている。
 - W4A4 と W4A16 のどちらも、トークン予測確率の多くが 80% を超えており、高い確率で割り当てられたトークンが受理される
 - 受理されたトークンと比較して、棄却されたトークンの数はわずかである
 
-W4A4 と W4A16 について、トークン単位の Top-1 予想を比較し、その一致率を確認・検証する。
+W4A4 と W4A16 について、トークン単位の Top-1 予想を比較し、その一致率を確認するという実験を行なった。
+
+## 6.2 Research Question
+
+- Do the majority of W4A4 and W4A16 Top-1 token probabilities exceed 0.8?
+- Are tokens with high prediction probabilities more likely to have matching Top-1 predictions?
+- Is the number of Top-1 disagreements negligible compared with the number of agreements?
+- Does the high token-level similarity observed in the paper also appear during operational QSpec speculative decoding?
+
+## 6.3 論文との条件差
+
+| 項目 | 論文 Figure 2 | 今回の実験 |
+| -- | -- | -- |
+| 量子化方式 | Atom-based | QuaRot-based checkpoint |
+| 基準トークン列 | W4A16 で生成 | W4A4 の speculative proposal |
+| 評価方法 | 固定長の prefill | 実際の QSpec decoding |
+| Prefix | W4A16 生成列で固定 | QSpec の実行状態 |
+| Accepted | Top-1 一致 | top1_match として計測 |
+| Runtime sampler | 対象外 | 別途 runtime_status を記録 |
+
+
+## 6.4 実験環境
+
+AWS EC2: g6e.2xlarge
+GPU: NVIDIA L40S 48 GB
+GPU architecture: Ada Lovelace, Compute Capability 8.9
+
+Host OS: Ubuntu 24.04
+Container base: nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
+CUDA Toolkit: 12.5.1
+Python 3.10
+PyTorch: 2.5.1
+Transformers: 4.47.1
+QSpec: 1d8124fbb4e4950d69dc35b6fe963d4e559c1104
+vLLM: 0.1.dev4264+...
+BitBLAS: 0.1.0.post1
+Cuda compilation tools, release 12.5, V12.5.82
+
+## 6.5 環境作成
+### 6.5.1 Docker image
+nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
+
+### 6.5.2 QSpec と vLLM のビルド
+QSpec は、W4A4 による Draft 処理と W4A16 による Verify 処理を同一モデル上で切り替えるため、独自に変更された vLLM と CUDA 拡張を使用する。そのため、通常の PyPI 版 vLLM をインストールするだけでは QSpec を実行できない。本実験では、QSpec リポジトリに含まれる vLLM をソースコードからビルドした。
+
+#### ビルド依存関係のインストール
+pip, setuptools, wheel などの基本的なビルドツールを更新する。
+
+```bash
+python -m ensurepip --upgrade
+
+python -m pip install \
+    --upgrade \
+    pip setuptools wheel packaging ninja cmake
+```
+
+続いて、QSpec リポジトリが提供する依存関係ファイルを使用する。
+
+```bash
+python -m pip install -r requirements-build.txt
+python -m pip install -r requirements-cuda.txt
+```
+
+pyproject.toml では、ビルド時の依存関係として `torch==2.5.1` が指定されているため、vLLM のビルド前に PyTorch が正しく導入されているかを確認した。
+
+```bash
+python - <<'PY'
+import torch
+
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+PY
+```
+
+実験環境では、NVIDIA L40S が PyTorch から認識されることを確認した。
+
+#### vLLM のソースビルド
+QSpec の公式 `install.sh` では、次のコマンドによってリポジトリ内の vLLM を editable install する。
+
+```bash
+pip install -e .
+```
+
+しかし、通常の pip ビルドでは PEP 517 の build isolation が有効になり、一時的なビルド環境が作成されるため、QSpec のビルド処理から既存の PyTorch や pip を正しく参照できなかった。そこで、あらかじめ構築した `qspec` 環境の PyTorch と CUDA を直接使用するため、`--no-build-isolation` を指定して vLLM をビルドした。
+
+```bash
+python -m pip install --no-build-isolation --editable .
+```
+
+`--editable` を使用することで、インストール後も `/workspace/QSpec` のソースコードが直接参照される。
+
+`--no-build-isolation` は、ビルド環境を自動的に分離しないため、必要なビルド依存関係を事前にインストールしておく必要がある。そのため、`requirements-build.txt` と `requirements-cuda.txt` を先に適用する。
+
+#### QSpec 関連のモジュールのビルド
+vLLM 本体のビルド後、QSpec が使用する以下のサブプロジェクトをインストールした。
+
+- TorchAO を基にした量子化機能
+- Fast Hadamard Transform
+- QuaRot
+- QSpec 独自の CUDA カーネル
+
+各モジュールについても、既存の PyTorch/CUDA 環境を使用するため、build isolation を無効化した。
+
+```bash
+python -m pip install  --no-build-isolation --editable third-party/ao
+
+python -m pip install --no-build-isolation --editable third-party/fast-hadamard-transform
+
+python -m pip install --no-build-isolation --editable third-party/QuaRot
+
+python -m pip install  --no-build-isolation third-party/kernels
+```
+
+サブプロジェクトの依存関係によって、すでに構築した PyTorch, Transformers, NumPy などが別バージョンへ変更される可能性がある。再インストールする場合は、必要に応じて `--no-deps` を指定し、主要パッケージのバージョンが更新されないようにする。
+
+```bash
+python -m pip install --no-deps --no-build-isolation --editable third-party/QuaRot
+```
+
+QSpec の W4A4 および W4A16 線形層は BitBLAS を利用するため、BitBLAS も追加する。
+
+```bash
+python -m pip install "bitblas==0.1.0.post1"
+```
+
+#### Python パッケージの互換性調整
+サブプロジェクトのインストール後、Transformers が `4.57.6` へ更新され、QSpec 版 vLLM が使用する `ProcessorMixin` を import できなくなった。
+
+```
+ImportError: cannot import name 'ProcessorMixin' from 'transformers'
+```
+
+そこで、QSpec 版 vLLM と互換性のあるバージョンへ固定した。
+
+```bash
+python -m pip install --force-reinstall "transformers==4.47.1"
+```
+
+また、QSpec 版 vLLM は `numpy < 2.0.0` を要求するため、NumPy を `1.26.4` へ固定した。GSM8K の読み込みに使用する Datasets との互換性を保つため、fsspec も調整した。
+
+```bash
+python -m pip install "numpy==1.26.4" "fsspec[http]==2026.6.0"
+```
+
+#### ビルド結果の確認
+最終的な依存関係の整合性は次のコマンドで確認した。
+
+```bash
+python -m pip check
+```
+
+また、vLLM の Python モジュール が QSpec リポジトリから読み込まれていることを確認した。
+
+```bash
+python - <<'PY'
+  import torch
+  import vllm
+  import vllm._C
+  print("vLLM:", vllm.__file__)
+  print("vllm._C: OK")
+  print("CUDA:", torch.cuda.is_available())
+  print("GPU:", torch.cuda.get_device_name(0))
+  print("Environment verification: OK")
+  PY
+		
+INFO 07-31 07:26:51 __init__.py:183] Automatically detected platform cuda.
+vLLM: /workspace/QSpec/vllm/__init__.py
+vllm._C: OK
+CUDA: True
+GPU: NVIDIA L40S
+Environment verification: OK
+```
+
+## 6.6 データセットとプロンプトの構築
+本章では、W4A4 と W4A16 のトークン予測を比較するために使用したデータセットと、モデルへ入力するプロンプトの構築方法について説明する。
+
+### 6.6.1 GSM8K データセット
+評価データには、算数文章問題データセットである GSM8K (Grade School Math 8K) を使用した。GSM8K には、小学校レベルの四則演算を中心とする文章問題と、途中の推論過程を含む回答が収録されている。
+データセットの構成は次のとおりである。
+
+| Split | 問題数 | 本実験での用途 |
+| --- | --- | --- |
+| Train | 7473 | 8-shot 例題の取得 |
+| Test | 1319 | W4A4 と W4A16 の比較評価 |
+
+
+実行時に `--num-samples 1319` を指定し、test split に含まれる 1319 問全てを評価対象とした。
+
+GSM8K を選択した理由は、QSpec 論文の評価で使用されているデータセットの一つであり、比較的長い推論過程を生成するためである。
+
+データセットは Hugging Face Datasets を通じてロードした。
+
+```python
+train = datasets.load_dataset(
+    "openai/gsm8k",
+    "main",
+    split="train",
+)
+
+test = datasets.load_dataset(
+    "openai/gsm8k",
+    "main",
+    split="test",
+)
+```
+
+本実験の主目的は、GSM8K の正確率を測定することではなく、回答生成中における以下の性質をトークン単位で調べることである。
+
+- W4A4 と W4A16 が出力する Top-1 予測確率
+- 二つの量子化方式の Top-1 トークンの一致
+- 確率が 0.8 を超える高信頼トークンの割合
+- Draft トークンの受容、棄却および破棄の状態
+
+したがって、test split に含まれる正解文は評価プロンプトには挿入せず、入力問題のみを使用した。
+
+### 6.6.2 Few-shot 例の選択
+実行時に `--shots 8` を指定し、8-shot プロンプトを構築した。今回は、GSM8K train split の先頭から順に8問を選択している。
+各例題は、次の形式で構成される。
+
+```txt
+Question: <train splitの問題文>  Answer: <解答過程と最終回答>
+```
+
+GSM8K の answer フィールドには、計算過程と最終回答が含まれる。このため、Few-shot 例は、モデルに途中の推論過程を含む回答形式を示す役割を持つ。
+
+### 6.6.3 評価プロンプトの構築
+各テスト問題について、固定された8個の Few-shot 例の後に評価対象の問題を連結した。プロンプトの概念的な構造は次のようになる。
+
+```txt
+Question: <train[0]の問題>  Answer: <train[0]の解答>
+Question: <train[1]の問題>  Answer: <train[1]の解答>
+Question: <train[2]の問題>  Answer: <train[2]の解答>
+Question: <train[3]の問題>  Answer: <train[3]の解答>
+Question: <train[4]の問題>  Answer: <train[4]の解答>
+Question: <train[5]の問題>  Answer: <train[5]の解答>
+Question: <train[6]の問題>  Answer: <train[6]の解答>
+Question: <train[7]の問題>  Answer: <train[7]の解答>
+Question: <test問題> Answer:
+```
+
+全ての問題で同じ8個の Few-shot 例を使用し、最後の評価問題だけを置き換えた。これにより、Few-shot 例の選択や順序の違いが予測結果へ与える影響を排除した。
+
+### 6.6.4 Llama 用の会話テンプレートの適用
+
+作成した文字列をそのまま vLLM へ入力するのではなく、Meta-Llama3-8B-Instruct 用の会話テンプレートを適用した。
+
+```python
+template_name = get_conv_template_name(
+    "Meta-Llama3-8B-Instruct"
+)
+
+conversation = get_conv_template(template_name)
+conversation.append_message(
+    conversation.roles[0],
+    raw,
+)
+conversation.append_message(
+    conversation.roles[1],
+    "",
+)
+
+prompt = conversation.get_prompt()
+```
+
+### 6.6.5 リクエストID
+各評価リクエストには、GSM8K test split のインデックスに対応する ID を付与した。
+
+```txt
+gsm8k-test-0
+gsm8k-test-1
+gsm8k-test-2
+...
+gsm8k-test-1318
+```
+
+### 6.6.6 生成条件
+GSM8K プロンプトに対する生成条件は、スクリプト内で `SamplingParams` として次のように設定した。
+
+```python
+sampling = SamplingParams(
+    temperature=0.0,
+    top_p=1.0,
+    max_tokens=max_tokens,
+    stop_token_ids=[128001, 128009],
+    stop=["Question:"],
+    seed=seed,
+)
+```
+
+| 項目 | 設定値 | 意味 |
+| temperature | 0.0 | 決定的な生成 |
+| top_p | 1.0 | 確率質量による候補制限を行わない |
+| max_tokens | 512 | 1問あたりの最大生成トークン数 |
+| stop | Question: | 次の問題の生成開始時に停止 |
+| stop_token_ids | 128001, 128009 | Llama 3 の終了系トークンで停止 |
+| seed | 0 | 乱数シードを固定 |
+
+乱数シードは Python のサンプル選択だけでなく、PyTorch と CUDA についても固定した。
+
+```python
+torch.manual_seed(args.experiment_seed)
+torch.cuda.manual_seed_all(args.experiment_seed)
+```
+
+### 6.6.7 QSpec の実行条件
+実験には、次のコマンドを使用した。
+
+```
+python trace_qspec_tokens.py \
+    --model /data/models/Llama3_8B_Instruct_QSpec \
+    --speculative-model /data/models/Llama3_8B_Instruct_QSpec \
+    --num-speculative-tokens 3 \
+    --max_num_seqs 1 \
+    --trust-remote-code \
+    --enforce-eager \
+    --num-samples 1319 \
+    --shots 8 \
+    --confidence-threshold 0.8 \
+    --trace-output-dir results/qspec-token-trace-all
+```
+
+
+各Draftトークンについて、以下の情報を取得した。
+
+- GSM8KのリクエストID
+- Speculative Decodingのサイクル番号
+- Draft内のトークン位置
+- 回答全体における出力位置
+- プロンプト長
+- W4A4が提案したトークン
+- W4A4におけるTop-1トークンと確率
+- W4A16におけるTop-1トークンと確率
+- W4A4とW4A16のTop-1が一致したか
+- 両方のTop-1確率が0.8を超えたか
+- 実際のQSpec実行で受容、棄却、破棄のいずれになったか
+
