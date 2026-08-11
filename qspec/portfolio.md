@@ -1,0 +1,538 @@
+# 1. Overview
+## 1.1 論文タイトル
+J Zhao et al. "QSPEC: Speculative Decoding with Complementary Quantization Schemes", 2025.
+
+## 1.2 QSPEC が解決する問題
+低精度で高速な W4A4 をドラフト生成に、高精度な W4A16 を検証に利用する Speculative Decoding である。両者で量子化済み Weight と KV キャッシュを共有することで、追加モデルによるメモリ増加を抑えながら、W4A16 相当の生成品質と高速化を両立する。
+
+## 1.3 中心的なアイディア
+単一の量子化済み重み
+Draft フェーズにおいて、Weight-Activation 量子化を適用し、低精度だが高速なドラフト生成を行う。Verify フェーズでは、Weight-only 量子化を適用し、高精度な予測確率を得る。また、W4A4 と W4A16 において重みを別々に保存せず、共有することで効率化する。さらに、KV キャッシュを共有し、検証済みのトークンについて W4A4 による低精度なキャッシュを W4A16 による高精度なキャッシュで上書きする (KV Cache Overwriting)。
+
+## 1.4 主な実験結果
+QSPEC は W4A16 の生成品質をほぼ完全に維持することができる。従来の W4A4 では、HATH や HumanEval といった多段階推論タスクにおいて大幅な精度低下が見られたが、QSPEC ではこれらを補完的に改善することができる。  
+また、W4A16 と比較してトークン生成のスループットが最大1.64倍向上する。有効トークンあたりのレイテンシを 26.5-30.6% 削減することに成功している。  
+ドラフト生成されたトークンの承認率は、vLLM を用いたテストで 93-95% と非常に高い。KV キャッシュの共有によりメモリオーバーヘッドを低減できている。さらに、スケーラビリティの観点で、バッチサイズが大きくても性能が劣化しにくい(最大32まで検証)。
+
+# 2. Background
+
+## 2.1 LLM 推論と量子化
+
+### 2.1.1 Weight-only 量子化
+モデルの重みだけを低精度化する方式である。例えば、W4A16 では、モデルの重みを4ビットに量子化して保存し、活性化 (Activation) には、FP16 などの16ビット形式を使用する。
+
+### 2.1.2 Weight-Activation 量子化
+重みと活性化の両方を同時に量子化し、高精度への逆量子化を行うことなく、低精度カーネルで演算する方式である。低精度演算に対応したハードウェア機能を活用して高速に推論することができる。
+
+### 2.1.3 W4A16 と W4A4 の違い
+**W4A16** は、モデルの重みを INT4 などで保存し、活性化は FP16 / BF16 で扱う。実際の実装では、4ビットの重みを GPU から読み出し、計算時には FP16 などへ逆量子化して行列積を行うことがある。
+
+**W4A4** は、重みと活性化の両方を4ビットに量子化する。  
+行列積の入力は4ビットだが、積和演算の結果は値が大きくなるため、通常は INT32 などの高い精度で累積する。その後、スケールを適用して FP16 や INT4 などへ変換する。
+
+### 2.1.4 重みの逆量子化
+重みの逆量子化 (dequantization) とは、INT4 などで小さく保存された重みを、行列積で扱える FP16/BF16 などの値へ戻す処理である。
+
+**例: W4A16 での逆量子化**  
+W4A16 では、重みは4ビット、活性化は FP16/BF16 となる。
+
+```math
+Y = X_{FP16} \hat W_{FP16}
+```
+
+ここで、
+
+```math
+\hat W_{FP16} = s \big(W_{INT4} - z\big)
+```
+
+として、4ビット重みを FP16 などへ逆量子化してから行列積を行う。
+
+**実際の処理**では、以下のような "fused dequantization" が用いられる。
+
+1. INT4 重みを GPU メモリからタイル単位で読み込む
+2. 4ビット値をレジスタや共有メモリ上で展開する
+3. スケールを適用して FP16/BF16 へ変換する
+4. 直後に活性化との行列積を行う
+
+### 2.1.5 低精度カーネルによる高速化
+INT4, INT8, FP8 などのデータ型に合わせて実行の効率化を図ったカーネル。具体的には以下のような理由で高速化する。
+
+- メモリから読み取るデータを減らす  
+FP16 の重みを W4 にすると、理論上の重みサイズは 1/4 となり、メモリから転送するデータ量を削減することができる
+- キャッシュやレジスタを有効活用する  
+データを小さくすることで、キャッシュや共有メモリへ、より多くの要素を置くことができる
+- 専用演算器のスループットを高められる  
+GPU や NPU には、低精度の行列積を高速に処理する専用演算器がある。一般に低精度になるほど1命令で扱うことのできる要素数は増やすことができる
+
+### 2.1.6 Decode がメモリ帯域律速になりやすい理由
+最大の理由は、1トークンを生成するために、巨大な重みと KV キャッシュを読み込む必要がある一方、小バッチではそれらを十分に再利用できないため。
+Prefill フェーズでは、プロンプト中の多数のトークンを並列計算しトークンを並列計算することができるが、 Decode フェーズでは、原則として1ステップずつ逐次生成する必要がある。
+
+
+| 段階 | 入力 | 特徴 |
+| -- | -- | -- |
+| Prefill | プロンプト中の多数のトークン | 多数のトークンを並列計算できる |
+| Decode | 新しい1トークン | 原則として1ステップずつ逐次生成する |
+
+## 2.2 Speculative Decoding
+### 2.2.1 Draft モデルと Target モデル
+Speculative Decoding は、小さく高速な Draft モデルが複数の候補トークンを先に生成し、大きな Target モデルがそれらをまとめて検証することで、出力品質を維持しながら Decode を高速化する手法である。
+
+### 2.2.2 Accept/Reject の流れ
+それまでの文脈 $ h $ に対して、Draft モデルの確率分布を $ q(x|h) $ 、Target モデルの確率分布を $ p(x|h) $ とした場合、Draft が候補 $ x $ を生成したとき、基本的な Speculative Sampling では次の確率で受理する。
+
+```math
+a(x) = min \big( 1, \frac{p(x|h)}{q(x|h)}\big )
+```
+
+常に最大確率のトークンを選ぶ Greedy Decoding では、Target モデルの最大確率トークンが Draft 候補と一致すれば受理される。
+
+### 2.2.3 受容率と高速化率の関係
+受容率が高いほど、Target モデル1回の検証で確定できるトークン数が増えるため、基本的に高速化率も高くなる。  
+ただし、Speculative Decoding では、最初の棄却が起きた時点で、それより後ろの候補を採用できないため、先頭からのトークン受理率が重要である。
+1 ラウンドで受理される Draft トークン数 A の期待値は以下で表される。
+
+```math
+E[A] = \alpha + \alpha^2 + ... + \alpha^K = \frac{\alpha(1-\alpha^K)}{1-\alpha}
+```
+
+標準的な Speculative Sampling では、Draft 候補が途中で棄却された場合、Target モデルの分布から補正トークンを1個生成する。また、すべての候補が受理された場合にも、Target が計算した追加の1トークンを使用できる。したがって、1ラウンドで確定するトークン数 $ L $ は、
+
+```math
+L = A + 1
+```
+
+と考えられ、その期待値は以下で表される。
+
+```math
+E[L] = 1 + \alpha + \alpha^2 + ... + \alpha^K = \frac{1-\alpha^{K+1}}{1-\alpha}
+```
+
+通常の Target モデルが1トークンを生成する時間を $ T_{target} $ とする。
+Speculative Decoding の1ラウンドに必要な時間を以下とする。
+
+```math
+T_{round} = T_{draft} + T_{verify} + T_{overhead}
+```
+
+この場合の高速化率は以下で表される。
+
+```math
+S \approx \frac{E[L]T_{target}}{T_{draft}+T_{verify}+T_{overhead}}
+```
+
+# 3. Motivation
+
+ここでは、論文に記載されている QSPEC の着想に至る次の2つの観察について述べる。
+
+- W4A4 は、多段階推論タスクにおいて、最終的な性能が大きく低下する
+- 一方で、トークン単位で見ると、W4A4 と W4A16 の予想はよく似ている
+
+## 3.1 W4A4 の活性化量子化は多段階推論に影響しやすい
+Atom や QuaRot などの Weight-Activation 量子化手法は、一般的なベンチマークでは、Weight-only 量子化に近い性能を保ちながら、推論を高速化できると報告されている。  
+しかし、QSPEC の論文著者らは、従来の評価で使用されてきたタスクだけでは、活性化量子化による性能低下を十分に捉えることはできないと述べている。また、それを示すベンチマークとして、Llama-3-8B-instruct に Atom ベースの量子化を適用し、次のタスクで W16A16, W4A16, W4A4 を比較している。
+
+- WikiText-2 : 文章に対する予測問題
+- PIQA : 物理的な常識推論
+- GSM8K : 複数のステップを必要とする算数問題
+- MBPP : Python プログラムの生成問題
+
+結果、WikiText-2 や PIQA では、W4A4 の性能低下は比較的小さい範囲に収まっている。一方で、GSM8K や MBPP では、W4A4 の性能が平均で約 30% 低下するのに対し、W4A16 は約 4% の低下にとどまっている。  
+論文ではこの結果から、W4A4 の活性化量子化は、GSM8K や MBPP など多段階推論タスクに影響すると主張している。
+
+## 3.2 W4A4 と W4A16 のトークン予測はよく似ている
+論文の著者らによると、トークン単位の予想では、W4A4 と W4A16 の Top-1 予想には類似性がある。この性質を確認するために、GSM8K テストセットを用いて、以下の実験を行なっている。
+
+- Atom ベースの A4W16 を用いた貪欲サンプリングを行い、各問題に対する回答トークンを生成する
+- Atom ベースの W4A16 が選択した Top-1 トークンと、その予想確率を記録する
+- 問題文と W4A16 が生成した回答を連結し、W4A4 で順伝播を1回実行する
+- 各トークン位置における W4A4 と W4A16 の予想を比較する
+
+論文の図2から、次の2点が確認できる。
+
+- W4A4 と W4A16 のどちらも、トークン予測確率の多くが 80% を超えている
+- 棄却されるトークンは、受容されるトークンと比べてわずかである
+
+つまり、W4A4 は最終的なタスク性能こそ大きく低下するものの、生成するトークンの大部分は W4A16 と一致している。  
+ほとんどのトークンが一致しているにも関わらず、W4A4 の性能は大きく低下する理由について、著者らは、少数の重要なトークンに生じる予測の違いであると述べている。自己回帰型の LLM では、それまでに生成したすべてのトークンから、次のトークンを予測するため、ある推論ステップで誤ったトークンを生成すると、その誤りを含む文脈に基づいて、後続のトークンが生成され、その後の推論全体が誤った方向へ進む可能性がある。
+
+# 4. QSPEC
+先の実験結果から、大部分のトークンを高速な W4A4 で生成し、少数の重要な誤りだけを W4A16 で検出・修正するという QSPEC の着想が得られる。  
+ここでは、QSPEC の構成について述べる。
+
+## 4.2 Draft フェーズ
+QSPEC では、次の $ \gamma $ 個のトークン $ \hat T_{i+1:i+\gamma} $ と関連する分布 $\hat {p}_{i+1:i+\gamma}(t) $ を予想するために、W4A4 による Weight-Activation 量子化と重みを共有する量子化スキームを採用している。活性化の精度を低減しているため、高速なトークン生成が可能となる。
+
+## 4.3 Verify フェーズ
+W4A4 の性能低下を補うため、Verify フェーズでは、高精度な Weight-only 量子化を用いる。
+具体的には、高精度量子化モデル $M_h$ が $T_{\le i}$ と $\hat{T}_{i+1:i+\gamma}$ を連結したものを入力として受け取り、高品質な予測確率 $p_{i+1:i+\gamma+1}(t)$ を出力する。
+
+## 4.4 重みの共有
+QSPEC では、W4A4 と W4A16 の計算において別々の重みを保存せず、同じ4ビットの量子化済み重みを用いる。つまり、W4A4 と W4A16 の違いは重みではなく、主に活性化の精度と計算カーネルである。
+
+## 4.5 KV キャッシュの上書き
+QSPEC では、受理されたトークンに対して、W4A4 による低精度な KV キャッシュを W4A16 によるキャッシュで置き換える。これにより、後続のデコーディング処理において、高品質なコンテキスト情報を利用できるようにする。  
+単一モデル内で重みを共有し、KV キャッシュを再利用することで、QSPEC は二重のキャッシュ管理を不要にし、精度を犠牲にすることなくメモリ使用量を削減できる。
+
+# 5. 実験結果の読み解き
+## 5.1 Fidelity
+論文の Table 3 では、Atom と QuaRot の2種類の量子化手法において、W16A16, W4A16, QSPEC, W4A4 の精度を比較している。結果として、W4A4 では GSM8K, MATH, MBPP など複雑な推論タスクで精度が大きく低下しているが、QSPEC では W4A16 と同程度の精度を保っている。  
+QSPEC は W4A4 の結果を W4A16 の予想と比較して検証しているため、原理的に W4A16 と同等の精度が得られる。しかし、PyTorch の非決定的な演算や数値誤差により、完全に一致するわけではない。
+
+## 5.2 Throughput
+論文の Table 4 では、3B, 7B, 13B の Llama モデルでバッチ数を8, 16, 32と変化させて W4A16, W4A4, QSPEC の推論速度を比較している。結果として、W4A16 に比べ、平均して1.4倍、最大1.64倍の性能向上が認められる。
+これは、以下の理由によるものと考えられる。
+
+- W4A4 の低精度カーネルによる高速なドラフト
+- W4A16 による複数ドラフトトークンの並列検証
+
+## 5.3 Memory
+Table 5 では、Llama-2-7b-chat-hf における QSPEC と EAGLE の比較を示している。EAGLEは、単一シーケンスの入力（バッチサイズ1）において最適な性能を発揮するが、バッチサイズが増加する（8および16）につれて、効率低下する。また、EAGLE のドラフトモデルは KV ストレージが増えることで16バッチで OOM となっている。それに対し、QSPEC は優れたスケーラビリティとメモリ効率を示しているとしている。
+
+# 6. 検証
+## 6.1 W4A4 と W4A16 における Top-1 一致率の検証
+論文では、図2において以下の性質が認められている。
+- W4A4 と W4A16 のどちらも、トークン予測確率の多くが 80% を超えており、高い確率で割り当てられたトークンが受理される
+- 受理されたトークンと比較して、棄却されたトークンの数はわずかである
+
+W4A4 と W4A16 について、トークン単位の Top-1 予想を比較し、その一致率を確認するという実験を行なった。
+
+## 6.2 Research Question
+
+- Do the majority of W4A4 and W4A16 Top-1 token probabilities exceed 0.8?
+- Are tokens with high prediction probabilities more likely to have matching Top-1 predictions?
+- Is the number of Top-1 disagreements negligible compared with the number of agreements?
+- Does the high token-level similarity observed in the paper also appear during operational QSpec speculative decoding?
+
+## 6.3 論文との条件差
+
+| 項目 | 論文 Figure 2 | 今回の実験 |
+| -- | -- | -- |
+| 量子化方式 | Atom-based | QuaRot-based checkpoint |
+| 基準トークン列 | W4A16 で生成 | W4A4 の speculative proposal |
+| 評価方法 | 固定長の prefill | 実際の QSpec decoding |
+| Prefix | W4A16 生成列で固定 | QSpec の実行状態 |
+| Accepted | Top-1 一致 | top1_match として計測 |
+| Runtime sampler | 対象外 | 別途 runtime_status を記録 |
+
+
+## 6.4 実験環境
+
+AWS EC2: g6e.2xlarge
+GPU: NVIDIA L40S 48 GB
+GPU architecture: Ada Lovelace, Compute Capability 8.9
+
+Host OS: Ubuntu 24.04
+Container base: nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
+CUDA Toolkit: 12.5.1
+Python 3.10
+PyTorch: 2.5.1
+Transformers: 4.47.1
+QSpec: 1d8124fbb4e4950d69dc35b6fe963d4e559c1104
+vLLM: 0.1.dev4264+...
+BitBLAS: 0.1.0.post1
+Cuda compilation tools, release 12.5, V12.5.82
+
+## 6.5 環境作成
+### 6.5.1 Docker image
+nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
+
+### 6.5.2 QSpec と vLLM のビルド
+QSpec は、W4A4 による Draft 処理と W4A16 による Verify 処理を同一モデル上で切り替えるため、独自に変更された vLLM と CUDA 拡張を使用する。そのため、通常の PyPI 版 vLLM をインストールするだけでは QSpec を実行できない。本実験では、QSpec リポジトリに含まれる vLLM をソースコードからビルドした。
+
+#### ビルド依存関係のインストール
+pip, setuptools, wheel などの基本的なビルドツールを更新する。
+
+```bash
+python -m ensurepip --upgrade
+
+python -m pip install \
+    --upgrade \
+    pip setuptools wheel packaging ninja cmake
+```
+
+続いて、QSpec リポジトリが提供する依存関係ファイルを使用する。
+
+```bash
+python -m pip install -r requirements-build.txt
+python -m pip install -r requirements-cuda.txt
+```
+
+pyproject.toml では、ビルド時の依存関係として `torch==2.5.1` が指定されているため、vLLM のビルド前に PyTorch が正しく導入されているかを確認した。
+
+```bash
+python - <<'PY'
+import torch
+
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+PY
+```
+
+実験環境では、NVIDIA L40S が PyTorch から認識されることを確認した。
+
+#### vLLM のソースビルド
+QSpec の公式 `install.sh` では、次のコマンドによってリポジトリ内の vLLM を editable install する。
+
+```bash
+pip install -e .
+```
+
+しかし、通常の pip ビルドでは PEP 517 の build isolation が有効になり、一時的なビルド環境が作成されるため、QSpec のビルド処理から既存の PyTorch や pip を正しく参照できなかった。そこで、あらかじめ構築した `qspec` 環境の PyTorch と CUDA を直接使用するため、`--no-build-isolation` を指定して vLLM をビルドした。
+
+```bash
+python -m pip install --no-build-isolation --editable .
+```
+
+`--editable` を使用することで、インストール後も `/workspace/QSpec` のソースコードが直接参照される。
+
+`--no-build-isolation` は、ビルド環境を自動的に分離しないため、必要なビルド依存関係を事前にインストールしておく必要がある。そのため、`requirements-build.txt` と `requirements-cuda.txt` を先に適用する。
+
+#### QSpec 関連のモジュールのビルド
+vLLM 本体のビルド後、QSpec が使用する以下のサブプロジェクトをインストールした。
+
+- TorchAO を基にした量子化機能
+- Fast Hadamard Transform
+- QuaRot
+- QSpec 独自の CUDA カーネル
+
+各モジュールについても、既存の PyTorch/CUDA 環境を使用するため、build isolation を無効化した。
+
+```bash
+python -m pip install  --no-build-isolation --editable third-party/ao
+
+python -m pip install --no-build-isolation --editable third-party/fast-hadamard-transform
+
+python -m pip install --no-build-isolation --editable third-party/QuaRot
+
+python -m pip install  --no-build-isolation third-party/kernels
+```
+
+サブプロジェクトの依存関係によって、すでに構築した PyTorch, Transformers, NumPy などが別バージョンへ変更される可能性がある。再インストールする場合は、必要に応じて `--no-deps` を指定し、主要パッケージのバージョンが更新されないようにする。
+
+```bash
+python -m pip install --no-deps --no-build-isolation --editable third-party/QuaRot
+```
+
+QSpec の W4A4 および W4A16 線形層は BitBLAS を利用するため、BitBLAS も追加する。
+
+```bash
+python -m pip install "bitblas==0.1.0.post1"
+```
+
+#### Python パッケージの互換性調整
+サブプロジェクトのインストール後、Transformers が `4.57.6` へ更新され、QSpec 版 vLLM が使用する `ProcessorMixin` を import できなくなった。
+
+```
+ImportError: cannot import name 'ProcessorMixin' from 'transformers'
+```
+
+そこで、QSpec 版 vLLM と互換性のあるバージョンへ固定した。
+
+```bash
+python -m pip install --force-reinstall "transformers==4.47.1"
+```
+
+また、QSpec 版 vLLM は `numpy < 2.0.0` を要求するため、NumPy を `1.26.4` へ固定した。GSM8K の読み込みに使用する Datasets との互換性を保つため、fsspec も調整した。
+
+```bash
+python -m pip install "numpy==1.26.4" "fsspec[http]==2026.6.0"
+```
+
+#### ビルド結果の確認
+最終的な依存関係の整合性は次のコマンドで確認した。
+
+```bash
+python -m pip check
+```
+
+また、vLLM の Python モジュール が QSpec リポジトリから読み込まれていることを確認した。
+
+```bash
+python - <<'PY'
+  import torch
+  import vllm
+  import vllm._C
+  print("vLLM:", vllm.__file__)
+  print("vllm._C: OK")
+  print("CUDA:", torch.cuda.is_available())
+  print("GPU:", torch.cuda.get_device_name(0))
+  print("Environment verification: OK")
+  PY
+		
+INFO 07-31 07:26:51 __init__.py:183] Automatically detected platform cuda.
+vLLM: /workspace/QSpec/vllm/__init__.py
+vllm._C: OK
+CUDA: True
+GPU: NVIDIA L40S
+Environment verification: OK
+```
+
+## 6.6 データセットとプロンプトの構築
+本章では、W4A4 と W4A16 のトークン予測を比較するために使用したデータセットと、モデルへ入力するプロンプトの構築方法について説明する。
+
+### 6.6.1 GSM8K データセット
+評価データには、算数文章問題データセットである GSM8K (Grade School Math 8K) を使用した。GSM8K には、小学校レベルの四則演算を中心とする文章問題と、途中の推論過程を含む回答が収録されている。
+データセットの構成は次のとおりである。
+
+| Split | 問題数 | 本実験での用途 |
+| --- | --- | --- |
+| Train | 7473 | 8-shot 例題の取得 |
+| Test | 1319 | W4A4 と W4A16 の比較評価 |
+
+
+実行時に `--num-samples 1319` を指定し、test split に含まれる 1319 問全てを評価対象とした。
+
+GSM8K を選択した理由は、QSpec 論文の評価で使用されているデータセットの一つであり、比較的長い推論過程を生成するためである。
+
+データセットは Hugging Face Datasets を通じてロードした。
+
+```python
+train = datasets.load_dataset(
+    "openai/gsm8k",
+    "main",
+    split="train",
+)
+
+test = datasets.load_dataset(
+    "openai/gsm8k",
+    "main",
+    split="test",
+)
+```
+
+本実験の主目的は、GSM8K の正確率を測定することではなく、回答生成中における以下の性質をトークン単位で調べることである。
+
+- W4A4 と W4A16 が出力する Top-1 予測確率
+- 二つの量子化方式の Top-1 トークンの一致
+- 確率が 0.8 を超える高信頼トークンの割合
+- Draft トークンの受容、棄却および破棄の状態
+
+したがって、test split に含まれる正解文は評価プロンプトには挿入せず、入力問題のみを使用した。
+
+### 6.6.2 Few-shot 例の選択
+実行時に `--shots 8` を指定し、8-shot プロンプトを構築した。今回は、GSM8K train split の先頭から順に8問を選択している。
+各例題は、次の形式で構成される。
+
+```txt
+Question: <train splitの問題文>  Answer: <解答過程と最終回答>
+```
+
+GSM8K の answer フィールドには、計算過程と最終回答が含まれる。このため、Few-shot 例は、モデルに途中の推論過程を含む回答形式を示す役割を持つ。
+
+### 6.6.3 評価プロンプトの構築
+各テスト問題について、固定された8個の Few-shot 例の後に評価対象の問題を連結した。プロンプトの概念的な構造は次のようになる。
+
+```txt
+Question: <train[0]の問題>  Answer: <train[0]の解答>
+Question: <train[1]の問題>  Answer: <train[1]の解答>
+Question: <train[2]の問題>  Answer: <train[2]の解答>
+Question: <train[3]の問題>  Answer: <train[3]の解答>
+Question: <train[4]の問題>  Answer: <train[4]の解答>
+Question: <train[5]の問題>  Answer: <train[5]の解答>
+Question: <train[6]の問題>  Answer: <train[6]の解答>
+Question: <train[7]の問題>  Answer: <train[7]の解答>
+Question: <test問題> Answer:
+```
+
+全ての問題で同じ8個の Few-shot 例を使用し、最後の評価問題だけを置き換えた。これにより、Few-shot 例の選択や順序の違いが予測結果へ与える影響を排除した。
+
+### 6.6.4 Llama 用の会話テンプレートの適用
+
+作成した文字列をそのまま vLLM へ入力するのではなく、Meta-Llama3-8B-Instruct 用の会話テンプレートを適用した。
+
+```python
+template_name = get_conv_template_name(
+    "Meta-Llama3-8B-Instruct"
+)
+
+conversation = get_conv_template(template_name)
+conversation.append_message(
+    conversation.roles[0],
+    raw,
+)
+conversation.append_message(
+    conversation.roles[1],
+    "",
+)
+
+prompt = conversation.get_prompt()
+```
+
+### 6.6.5 リクエストID
+各評価リクエストには、GSM8K test split のインデックスに対応する ID を付与した。
+
+```txt
+gsm8k-test-0
+gsm8k-test-1
+gsm8k-test-2
+...
+gsm8k-test-1318
+```
+
+### 6.6.6 生成条件
+GSM8K プロンプトに対する生成条件は、スクリプト内で `SamplingParams` として次のように設定した。
+
+```python
+sampling = SamplingParams(
+    temperature=0.0,
+    top_p=1.0,
+    max_tokens=max_tokens,
+    stop_token_ids=[128001, 128009],
+    stop=["Question:"],
+    seed=seed,
+)
+```
+
+| 項目 | 設定値 | 意味 |
+| temperature | 0.0 | 決定的な生成 |
+| top_p | 1.0 | 確率質量による候補制限を行わない |
+| max_tokens | 512 | 1問あたりの最大生成トークン数 |
+| stop | Question: | 次の問題の生成開始時に停止 |
+| stop_token_ids | 128001, 128009 | Llama 3 の終了系トークンで停止 |
+| seed | 0 | 乱数シードを固定 |
+
+乱数シードは Python のサンプル選択だけでなく、PyTorch と CUDA についても固定した。
+
+```python
+torch.manual_seed(args.experiment_seed)
+torch.cuda.manual_seed_all(args.experiment_seed)
+```
+
+### 6.6.7 QSpec の実行条件
+実験には、次のコマンドを使用した。
+
+```
+python trace_qspec_tokens.py \
+    --model /data/models/Llama3_8B_Instruct_QSpec \
+    --speculative-model /data/models/Llama3_8B_Instruct_QSpec \
+    --num-speculative-tokens 3 \
+    --max_num_seqs 1 \
+    --trust-remote-code \
+    --enforce-eager \
+    --num-samples 1319 \
+    --shots 8 \
+    --confidence-threshold 0.8 \
+    --trace-output-dir results/qspec-token-trace-all
+```
+
+
+各Draftトークンについて、以下の情報を取得した。
+
+- GSM8KのリクエストID
+- Speculative Decodingのサイクル番号
+- Draft内のトークン位置
+- 回答全体における出力位置
+- プロンプト長
+- W4A4が提案したトークン
+- W4A4におけるTop-1トークンと確率
+- W4A16におけるTop-1トークンと確率
+- W4A4とW4A16のTop-1が一致したか
+- 両方のTop-1確率が0.8を超えたか
+- 実際のQSpec実行で受容、棄却、破棄のいずれになったか
+
