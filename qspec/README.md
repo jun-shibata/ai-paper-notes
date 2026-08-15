@@ -15,6 +15,36 @@ The tracing script also records the probability assigned to each proposed token,
 
 The script applies a runtime hook to `SpecDecodeWorker._verify_tokens`. It does not modify the original QSpec source files.
 
+
+## Results
+
+The evaluation used all 1,319 samples from the GSM8K test split with 8-shot prompts. QSpec was configured to generate up to three speculative tokens per draft–verify cycle. In total, 275,049 speculative positions were traced.
+
+<img src="https://github.com/jun-shibata/ai-paper-notes/blob/main/qspec/results/qspec_figure2_rep_20260810.png" width="60%">
+
+Each point represents a single draft position; points where the Top-1 tokens from both modes match are classified as "Top-1 Match," while those that do not match are classified as "Top-1 Mismatch." The density curves at the top and right of the graph show the marginal distributions of Top-1 probabilities for W4A16 and W4A4, respectively.  
+Matching points are concentrated in the high-probability region at the top right, whereas mismatches are more frequent in regions of relatively low probability. This distribution visually demonstrates the relationship between high Top-1 probability and a high match rate.
+
+W4A4 and W4A16 predicted the same Top-1 token at 263,984 positions, resulting in an overall Top-1 agreement rate of 95.98%.
+
+| Metric | Result |
+| :-: | :--- |
+| Requests | 1,319 |
+| Traced speculative positions | 275,049 |
+| Top-1 agreements | 263,984 (95.98%) |
+| Top-1 disagreements | 11,065 (4.02%) |
+
+The mean Top-1 probabilities were 92.51% for W4A4 and 92.99% for W4A16. Their median probabilities were 99.966% and 99.986%, respectively.
+
+| Metric | W4A4 | W4A16 |
+| :-: | :--- | :--- |
+| Mean Top-1 probability | 92.51% | 92.99% |
+| Median Top-1 probability | 99.966% | 99.986% |
+
+Both models assigned a Top-1 probability greater than 0.8 at 82.58% of the traced positions. Within this high-confidence region, the Top-1 agreement rate reached 99.96%. When both probabilities were at most 0.8, the agreement rate decreased to 70.56%.
+
+These results show that W4A4 and W4A16 produce highly similar token-level predictions during operational QSpec decoding, particularly when both modes are confident in their predictions. This finding is consistent with the token-level similarity reported in the QSpec paper.
+
 ## Requirements
 
 The Docker image is based on the following environment:
