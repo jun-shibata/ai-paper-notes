@@ -242,7 +242,7 @@ nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
 QSpec は、W4A4 による Draft 処理と W4A16 による Verify 処理を同一モデル上で切り替えるため、独自に変更された vLLM と CUDA 拡張を使用する。そのため、通常の PyPI 版 vLLM をインストールするだけでは QSpec を実行できない。本実験では、QSpec リポジトリに含まれる vLLM をソースコードからビルドした。
 AWS 上での環境構築は、`src/Dockerfile` を使用した。
 
-## 6.6 データセットとプロンプトの構築
+## 6.6 データセットとモデル
 本章では、W4A4 と W4A16 のトークン予測を比較するために使用したデータセットと、モデルへ入力するプロンプトの構築方法について説明する。
 
 ### 6.6.1 GSM8K データセット
@@ -284,96 +284,17 @@ test = datasets.load_dataset(
 
 したがって、test split に含まれる正解文は評価プロンプトには挿入せず、入力問題のみを使用した。
 
-### 6.6.2 Few-shot 例の選択
-実行時に `--shots 8` を指定し、8-shot プロンプトを構築した。今回は、GSM8K train split の先頭から順に8問を選択している。
-各例題は、次の形式で構成される。
+### 6.6.2 モデル
+推論モデルには、`AnonymousResearcher2025/Llama3_8B_Instruct_QSpec` を使用した。
+QSpec では、同一のモデルを、W4A4 モードと W4A16 モードで切り替えて実行する。
 
-```txt
-Question: <train splitの問題文>  Answer: <解答過程と最終回答>
-```
+同じ 4-bit 重み
+├─ activation を 4-bit で処理 → W4A4 モード
+└─ activation を 16-bit で処理 → W4A16 モード
 
-GSM8K の answer フィールドには、計算過程と最終回答が含まれる。このため、Few-shot 例は、モデルに途中の推論過程を含む回答形式を示す役割を持つ。
+今回は、W4A4 モードから得られた Top-1 トークンと W4A16 もーどから得られた Top-1 トークンを使用した。
 
-### 6.6.3 評価プロンプトの構築
-各テスト問題について、固定された8個の Few-shot 例の後に評価対象の問題を連結した。プロンプトの概念的な構造は次のようになる。
-
-```txt
-Question: <train[0]の問題>  Answer: <train[0]の解答>
-Question: <train[1]の問題>  Answer: <train[1]の解答>
-Question: <train[2]の問題>  Answer: <train[2]の解答>
-Question: <train[3]の問題>  Answer: <train[3]の解答>
-Question: <train[4]の問題>  Answer: <train[4]の解答>
-Question: <train[5]の問題>  Answer: <train[5]の解答>
-Question: <train[6]の問題>  Answer: <train[6]の解答>
-Question: <train[7]の問題>  Answer: <train[7]の解答>
-Question: <test問題> Answer:
-```
-
-全ての問題で同じ8個の Few-shot 例を使用し、最後の評価問題だけを置き換えた。これにより、Few-shot 例の選択や順序の違いが予測結果へ与える影響を排除した。
-
-### 6.6.4 Llama 用の会話テンプレートの適用
-
-作成した文字列をそのまま vLLM へ入力するのではなく、Meta-Llama3-8B-Instruct 用の会話テンプレートを適用した。
-
-```python
-template_name = get_conv_template_name(
-    "Meta-Llama3-8B-Instruct"
-)
-
-conversation = get_conv_template(template_name)
-conversation.append_message(
-    conversation.roles[0],
-    raw,
-)
-conversation.append_message(
-    conversation.roles[1],
-    "",
-)
-
-prompt = conversation.get_prompt()
-```
-
-### 6.6.5 リクエストID
-各評価リクエストには、GSM8K test split のインデックスに対応する ID を付与した。
-
-```txt
-gsm8k-test-0
-gsm8k-test-1
-gsm8k-test-2
-...
-gsm8k-test-1318
-```
-
-### 6.6.6 生成条件
-GSM8K プロンプトに対する生成条件は、スクリプト内で `SamplingParams` として次のように設定した。
-
-```python
-sampling = SamplingParams(
-    temperature=0.0,
-    top_p=1.0,
-    max_tokens=max_tokens,
-    stop_token_ids=[128001, 128009],
-    stop=["Question:"],
-    seed=seed,
-)
-```
-
-| 項目 | 設定値 | 意味 |
-| temperature | 0.0 | 決定的な生成 |
-| top_p | 1.0 | 確率質量による候補制限を行わない |
-| max_tokens | 512 | 1問あたりの最大生成トークン数 |
-| stop | Question: | 次の問題の生成開始時に停止 |
-| stop_token_ids | 128001, 128009 | Llama 3 の終了系トークンで停止 |
-| seed | 0 | 乱数シードを固定 |
-
-乱数シードは Python のサンプル選択だけでなく、PyTorch と CUDA についても固定した。
-
-```python
-torch.manual_seed(args.experiment_seed)
-torch.cuda.manual_seed_all(args.experiment_seed)
-```
-
-### 6.6.7 QSpec の実行条件
+### 6.7 QSpec の実行条件
 実験には、次のコマンドを使用した。
 
 ```
@@ -405,3 +326,41 @@ python trace_qspec_tokens.py \
 - 両方のTop-1確率が0.8を超えたか
 - 実際のQSpec実行で受容、棄却、破棄のいずれになったか
 
+### 6.8 結果
+
+結果は以下のとおりである。
+
+![top1_agreement](https://github.com/jun-shibata/ai-paper-notes/blob/main/qspec/results/qspec_figure2_rep_20260810.png)
+
+散布図の横軸は W4A16 モードの Top-1 確率、縦軸は W4A4 モードの Top-1 確率を示している。Top-1 確率とは、それぞれのモードが最有力と予測したトークンに割り当てた確率である。
+
+散布図の各点は、QSpec の draft–verify 処理で評価された1つの draft 位置を表す。W4A4 モードと W4A16 モードの Top-1 トークンが一致した点を Accepted、一致しなかった点を Rejected として色分けしている。
+また、グラフ上部と右側の Density は、それぞれ W4A16 モードと W4A4 モードにおける Top-1 確率の周辺分布である。
+得られたデータを集計した結果を表6.8.1に示す。
+
+表6.8.1
+| 項目 | 結果 |
+| :-: | :--- |
+| リクエスト数 | 1319 |
+| draft 位置数 | 275,049 |
+| 一致数 | 263,984 (95.98%) |
+| 不一致数 | 11,065 (4.02%) |
+
+275,049か所の draft 位置において、W4A4 モードと W4A16 モードの Top-1 一致率は 95.98% でした。両モードの Top-1 トークンは、大部分の位置で一致していることが分かる。
+
+Top-1 確率を集計した結果は、次のとおりである。
+
+| 指標 | W4A4 | W4A16 |
+| :-: | :--- |
+| Top-1確率の平均 | 92.51% | 92.99% |
+| 中央値 | 99.966% | 99.986% |
+
+Top-1 トークンの多くには非常に高い確率が割り当てられている。さらに、両モードの Top-1 確率がともに 0.8 を超える領域は、全体の 82.58% を占めている。この領域における Top-1 一致率は 99.96% である。一方、両モードの Top-1 確率がともに 0.8 以下の領域では、一致率が 70.56% まで低下した。
+
+今回の実験条件では、次の傾向が確認できた。
+
+- W4A4 モードと W4A16 モードのどちらにおいても、多くの位置で Top-1 確率が高い
+- 両モードの Top-1 トークンは 95.98% の位置で一致する
+- 両モードの Top-1 確率がともに 0.8 を超える場合、Top-1 トークンはほぼ常に一致する
+
+これらは、 W4A4 と W4A16 のトークン予測が大部分の位置で類似しているという、QSpec 論文の主張と整合する結果である。
