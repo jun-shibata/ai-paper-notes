@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 class Request:
     """Logical state owned by one inference request."""
     request_id: str
+    token_ids: list[int]
     block_ids: list[int] = field(default_factory=list)
     num_tokens: int = 0
     finished: bool = False
+    cached_token_count: int = 0
 
     def add_block(self, block_id: int) -> None:
         if self.finished:
